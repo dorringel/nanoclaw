@@ -221,7 +221,13 @@ export class TelegramChannel implements Channel {
 
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
 
       let content = placeholder;
       if (fileId) {
@@ -234,7 +240,10 @@ export class TelegramChannel implements Channel {
             content = `[Voice: ${transcript}]`;
           }
         } catch (err) {
-          logger.warn({ err, chatJid }, 'Voice message download failed, using placeholder');
+          logger.warn(
+            { err, chatJid },
+            'Voice message download failed, using placeholder',
+          );
         }
       }
 

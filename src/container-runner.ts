@@ -237,7 +237,6 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
-
   return mounts;
 }
 

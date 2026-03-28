@@ -1,37 +1,67 @@
+import { execFile } from 'child_process';
+import { writeFile, unlink, mkdtemp } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { promisify } from 'util';
 import { logger } from './logger.js';
 
+const execFileAsync = promisify(execFile);
+
+const WHISPER_BIN = process.env.WHISPER_BIN || 'whisper-cli';
+const WHISPER_MODEL =
+  process.env.WHISPER_MODEL || 'data/models/ggml-small.bin';
+
 /**
- * Transcribes an audio buffer using the OpenAI Whisper API.
+ * Transcribes an audio buffer using local whisper.cpp.
+ * Converts to 16kHz WAV via ffmpeg, then runs whisper-cli.
  * Returns the transcribed text, or null if transcription fails.
  */
 export async function transcribeAudio(
   audioBuffer: Buffer,
   filename: string,
 ): Promise<string | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    logger.warn('OPENAI_API_KEY not set — voice transcription unavailable');
-    return null;
-  }
-
+  let tmpDir: string | undefined;
   try {
-    const { OpenAI } = await import('openai');
-    const client = new OpenAI({ apiKey });
+    tmpDir = await mkdtemp(join(tmpdir(), 'whisper-'));
+    const inputPath = join(tmpDir, filename);
+    const wavPath = join(tmpDir, 'audio.wav');
 
-    const file = new File([audioBuffer], filename, { type: 'audio/ogg' });
-    const result = await client.audio.transcriptions.create({
-      file,
-      model: 'whisper-1',
-    });
+    await writeFile(inputPath, audioBuffer);
 
-    logger.info(
-      { chars: result.text.length },
-      'Transcribed voice message',
-    );
-    return result.text;
+    // Convert to 16kHz mono WAV (required by whisper.cpp)
+    await execFileAsync('ffmpeg', [
+      '-i', inputPath,
+      '-ar', '16000',
+      '-ac', '1',
+      '-f', 'wav',
+      wavPath,
+      '-y',
+    ], { timeout: 30_000 });
+
+    // Run whisper-cli
+    const { stdout } = await execFileAsync(WHISPER_BIN, [
+      '-m', WHISPER_MODEL,
+      '-f', wavPath,
+      '--no-timestamps',
+      '-nt',
+    ], { timeout: 120_000 });
+
+    const text = stdout.trim();
+    if (!text) return null;
+
+    logger.info({ chars: text.length }, 'Transcribed voice message');
+    return text;
   } catch (err) {
-    logger.error({ err }, 'OpenAI transcription failed');
+    logger.error({ err }, 'whisper.cpp transcription failed');
     return null;
+  } finally {
+    // Clean up temp files
+    if (tmpDir) {
+      try {
+        const { rm } = await import('fs/promises');
+        await rm(tmpDir, { recursive: true });
+      } catch { /* ignore cleanup errors */ }
+    }
   }
 }
 
