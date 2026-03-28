@@ -4,6 +4,7 @@ import { Api, Bot } from 'grammy';
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { transcribeAudio, downloadBuffer } from '../transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -201,10 +202,57 @@ export class TelegramChannel implements Channel {
       });
     };
 
+    // Download and transcribe a Telegram voice/audio message.
+    // Falls back to the plain placeholder if download or transcription fails.
+    const storeVoice = async (ctx: any, placeholder: string) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const msgId = ctx.message.message_id.toString();
+      const fileId: string | undefined =
+        ctx.message.voice?.file_id ?? ctx.message.audio?.file_id;
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+
+      let content = placeholder;
+      if (fileId) {
+        try {
+          const fileInfo = await ctx.api.getFile(fileId);
+          const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${fileInfo.file_path}`;
+          const audioBuffer = await downloadBuffer(fileUrl);
+          const transcript = await transcribeAudio(audioBuffer, 'voice.ogg');
+          if (transcript) {
+            content = `[Voice: ${transcript}]`;
+          }
+        } catch (err) {
+          logger.warn({ err, chatJid }, 'Voice message download failed, using placeholder');
+        }
+      }
+
+      this.opts.onMessage(chatJid, {
+        id: msgId,
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    };
+
     this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
+    this.bot.on('message:voice', (ctx) => storeVoice(ctx, '[Voice message]'));
+    this.bot.on('message:audio', (ctx) => storeVoice(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
       storeNonText(ctx, `[Document: ${name}]`);
