@@ -580,16 +580,12 @@ function ensureProxyNetwork(): void {
   // Fetch OneCLI gateway credentials so squid can chain to it.
   // The container-config endpoint returns the proxy URL with an auth token.
   try {
-    const configJson = run(
-      `curl -sf ${ONECLI_URL}/api/container-config`,
-    );
+    const configJson = run(`curl -sf ${ONECLI_URL}/api/container-config`);
     if (configJson) {
       const config = JSON.parse(configJson);
       const proxyUrl: string = config.env?.HTTPS_PROXY || '';
       // URL format: http://x:TOKEN@host.docker.internal:10255
-      const match = proxyUrl.match(
-        /^https?:\/\/([^:]+):([^@]+)@([^:]+):(\d+)/,
-      );
+      const match = proxyUrl.match(/^https?:\/\/([^:]+):([^@]+)@([^:]+):(\d+)/);
       if (match) {
         const [, user, token, , port] = match;
         writeSquidConfig(user, token, parseInt(port, 10));
