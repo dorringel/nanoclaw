@@ -342,14 +342,19 @@ async function runQuery(
   const stream = new MessageStream();
   stream.push(prompt);
 
+  // AbortController: allows forceful cancellation of the running query
+  // when the _close sentinel is detected (e.g. user wants to stop a diverging agent).
+  const abortController = new AbortController();
+
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
+      log('Close sentinel detected during query, aborting');
       closedDuringQuery = true;
+      abortController.abort();
       stream.end();
       ipcPolling = false;
       return;
@@ -412,6 +417,7 @@ async function runQuery(
         'mcp__nanoclaw__*'
       ],
       env: sdkEnv,
+      abortController,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
@@ -615,6 +621,30 @@ async function main(): Promise<void> {
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
+
+    // Stale session: the server no longer has this conversation.
+    // Clear the session ID and retry once with a fresh session instead of
+    // propagating the error (which causes the host to retry with the same
+    // broken ID in an infinite loop).
+    if (errorMessage.includes('No conversation found') && sessionId) {
+      log(`Stale session ${sessionId}, retrying with fresh session`);
+      sessionId = undefined;
+      resumeAt = undefined;
+      try {
+        const retryResult = await runQuery(prompt, undefined, mcpServerPath, containerInput, sdkEnv, undefined);
+        if (retryResult.newSessionId) sessionId = retryResult.newSessionId;
+        writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+        // Fall through to normal IPC loop would be ideal, but for simplicity
+        // just exit cleanly — the host will resume with the new session ID.
+        process.exit(0);
+      } catch (retryErr) {
+        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        log(`Retry also failed: ${retryMsg}`);
+        writeOutput({ status: 'error', result: null, error: retryMsg });
+        process.exit(1);
+      }
+    }
+
     log(`Agent error: ${errorMessage}`);
     writeOutput({
       status: 'error',

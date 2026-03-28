@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, spawn } from 'child_process';
+import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -20,7 +20,6 @@ import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_RUNTIME_BIN,
-  hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
@@ -29,6 +28,24 @@ import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL });
+
+/**
+ * Replace HTTP_PROXY / HTTPS_PROXY `-e` args with a new proxy URL.
+ * OneCLI's applyContainerConfig sets these to the OneCLI gateway, but we
+ * need containers to go through squid first (domain filtering), which then
+ * chains to OneCLI (credential injection) via cache_peer.
+ */
+function overrideProxyArgs(args: string[], squidUrl: string): void {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-e' && i + 1 < args.length) {
+      const val = args[i + 1];
+      if (val.startsWith('HTTP_PROXY=') || val.startsWith('HTTPS_PROXY=')) {
+        const key = val.split('=')[0];
+        args[i + 1] = `${key}=${squidUrl}`;
+      }
+    }
+  }
+}
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -220,6 +237,7 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
+
   return mounts;
 }
 
@@ -230,17 +248,31 @@ async function buildContainerArgs(
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  // Isolated network: containers can only reach squid and OneCLI.
+  // No default route to the internet — all egress goes through the proxy chain:
+  //   Container → Squid (domain allowlist) → OneCLI (credential injection) → Internet
+  args.push('--network', 'nanoclaw-internal');
+
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
+  // applyContainerConfig mounts the CA cert and sets NODE_EXTRA_CA_CERTS so
+  // Node.js trusts the OneCLI MITM certificate.  It also sets HTTP_PROXY /
+  // HTTPS_PROXY to OneCLI, but we override those below to point at squid
+  // (which chains to OneCLI via cache_peer for domain filtering first).
   const onecliApplied = await onecli.applyContainerConfig(args, {
-    addHostMapping: false, // Nanoclaw already handles host gateway
+    addHostMapping: false, // host.docker.internal resolves via Docker DNS alias
     agent: agentIdentifier,
   });
   if (onecliApplied) {
     logger.info({ containerName }, 'OneCLI gateway config applied');
+    // Override HTTP_PROXY/HTTPS_PROXY: point at squid instead of OneCLI.
+    // Squid enforces the domain allowlist, then forwards to OneCLI via cache_peer.
+    overrideProxyArgs(args, 'http://nanoclaw-squid:3128');
+    // gh CLI needs GH_TOKEN to activate — OneCLI MITM replaces it with the real
+    // token at request time, so the placeholder value doesn't matter.
+    args.push('-e', 'GH_TOKEN=placeholder');
   } else {
     logger.warn(
       { containerName },
@@ -248,8 +280,9 @@ async function buildContainerArgs(
     );
   }
 
-  // Runtime-specific args for host gateway resolution
-  args.push(...hostGatewayArgs());
+  // On the internal network, host.docker.internal resolves to OneCLI via Docker
+  // DNS alias — do NOT add --add-host which would override this with an
+  // unreachable host-gateway IP.
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
